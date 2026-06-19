@@ -38,15 +38,26 @@ namespace TisaiMultipath.Services
                 Utils.PrintRouteStates(routes.Keys.ToList(), true);
                 Thread.Sleep(1500);
 
-                //Clear routes that have been inactive for more than 5 seconds
+                // 15s ao inves de 5s — sob trafego alto o ping (1B) pode atrasar atras de
+                // rajadas WG e o Route do client "morria" no server, dropando a sessao.
                 foreach(Route r in routes.Keys.ToList())
                 {
-                    if((DateTime.UtcNow - r.LastPing).TotalSeconds > 5)
+                    if((DateTime.UtcNow - r.LastPing).TotalSeconds > 15)
                     {
                         routes.Remove(r);
                     }
                 }
             }
+        }
+
+        private static void TrySetLargeBuffers(UdpClient client)
+        {
+            try
+            {
+                client.Client.ReceiveBufferSize = 8 * 1024 * 1024;
+                client.Client.SendBufferSize = 8 * 1024 * 1024;
+            }
+            catch { }
         }
 
         //Received from MP Client to Server
@@ -55,6 +66,8 @@ namespace TisaiMultipath.Services
             Console.WriteLine("[Server] FwService is running...");
 
             fwClient = new UdpClient(port);
+            TrySetLargeBuffers(fwClient);
+            TrySetLargeBuffers(bckClient);
 
             //Route and queue to send packets received from MP Client directly to Server
             BlockingCollection<(byte[], UdpClient?)> queue = new BlockingCollection<(byte[], UdpClient?)>();
@@ -83,6 +96,13 @@ namespace TisaiMultipath.Services
                     {
                         BlockingCollection<(byte[], UdpClient?)>? _queue = new BlockingCollection<(byte[], UdpClient?)>();
                         routes.Add(new Route(_queue, null, fwClient) { IPAddress = _loopback.Address, Port = _loopback.Port }, _queue);
+                    }
+                    else
+                    {
+                        // Qualquer pacote recebido = rota viva. Atualiza LastPing do registro existente
+                        // pra nao expirar sob trafego alto enquanto o ping reply (1B) ta na fila.
+                        var existing = routes.Keys.FirstOrDefault(r => r.Equals(_route));
+                        if (existing != null) existing.LastPing = DateTime.UtcNow;
                     }
 
                     //Whenever clients enables/disables a route, a packet with 3 bytes is sent to this route letting the route know what state it should take

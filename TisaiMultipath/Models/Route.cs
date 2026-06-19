@@ -19,9 +19,12 @@ namespace TisaiMultipath.Models
 
         public Route(BlockingCollection<(byte[], UdpClient?)>? queue, BlockingCollection<byte[]>? bckQueue = null, UdpClient? udpClient = null)
         {
+            // Buffer alto evita kernel-drop dos pings quando rajada de WG enche o socket queue.
+            TrySetLargeBuffers(_routeUdp);
+
             if (queue != null)
                 Task.Run(() => WorkerThread(queue));
-            
+
             if(bckQueue != null)
             {
                 listenerTask = Task.Run(() => UdpThread(bckQueue));
@@ -95,6 +98,11 @@ namespace TisaiMultipath.Models
                 IPEndPoint _loopback = new IPEndPoint(IPAddress.Any, 0);
                 byte[] data = _routeUdp.Receive(ref _loopback);
 
+                // Qualquer pacote recebido = rota viva. Sob trafego alto o ping (1B) entra
+                // na fila atras dos WG e LastPing fica velha → CalculateDynamicRoutes desativava
+                // a rota mesmo com dados fluindo. Agora qualquer recv refresca o heartbeat.
+                LastPing = DateTime.UtcNow;
+
                 //Ping Packets will be bounced back - Wireguard Packets (and most regular packets) will always be larger than 2 byte
                 if (data.Length == 2)
                 {
@@ -110,6 +118,16 @@ namespace TisaiMultipath.Models
 
                 bckQueue.Add(data);
             }
+        }
+
+        private static void TrySetLargeBuffers(UdpClient client)
+        {
+            try
+            {
+                client.Client.ReceiveBufferSize = 8 * 1024 * 1024;
+                client.Client.SendBufferSize = 8 * 1024 * 1024;
+            }
+            catch { /* SO pode limitar; default e aceitavel */ }
         }
 
         public void SetActive(bool _active)
@@ -158,11 +176,12 @@ namespace TisaiMultipath.Models
 
                 Thread.Sleep(1500);
 
-                if(canRenewRoute && (DateTime.UtcNow - LastPing).TotalSeconds > 15)
+                if(canRenewRoute && (DateTime.UtcNow - LastPing).TotalSeconds > 30)
                 {
                     lock (_udpLock)
                     {
                         client = new UdpClient(0);
+                        TrySetLargeBuffers(client);
 
                         if (_bckQueue != null)
                         {

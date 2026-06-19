@@ -71,9 +71,11 @@ namespace TisaiMultipath.Services
 
         private static void CalculateDynamicRoutes()
         {
-
+            // 15s ao inves de 5s pra absorver janelas em que ping (1B) atrasa atras de
+            // rajadas WG sob trafego alto. Combinado com LastPing-em-qualquer-recv no Route,
+            // a rota so e considerada morta se realmente parar de receber qualquer pacote.
             int idx = 0;
-            foreach (Route route in routes.Keys.OrderBy(r => (DateTime.UtcNow - r.LastPing).TotalSeconds > 5 ? 999 : r.Latency))
+            foreach (Route route in routes.Keys.OrderBy(r => (DateTime.UtcNow - r.LastPing).TotalSeconds > 15 ? 999 : r.Latency))
             {
                 if (idx < maxRoutes)
                 {
@@ -87,11 +89,22 @@ namespace TisaiMultipath.Services
             }
         }
 
+        private static void TrySetLargeBuffers(UdpClient client)
+        {
+            try
+            {
+                client.Client.ReceiveBufferSize = 8 * 1024 * 1024;
+                client.Client.SendBufferSize = 8 * 1024 * 1024;
+            }
+            catch { }
+        }
+
         //Receive commands on Route Control Port
         private static void RouteControlService(int port)
         {
             Console.WriteLine("[Client] Route Control is running...");
             UdpClient rcClient = new UdpClient(port);
+            TrySetLargeBuffers(rcClient);
 
             while (true)
             {
@@ -171,6 +184,7 @@ namespace TisaiMultipath.Services
         {
             Console.WriteLine("[Client] FwService is running...");
             fwClient = new UdpClient(port);
+            TrySetLargeBuffers(fwClient);
 
             while (true)
             {
