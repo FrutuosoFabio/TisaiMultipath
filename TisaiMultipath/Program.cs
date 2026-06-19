@@ -1,8 +1,8 @@
-﻿using MultiPathSingularity.Services;
+﻿using TisaiMultipath.Services;
 using System.Net.Sockets;
 using System.Text.RegularExpressions;
 
-namespace MultiPathSingularity;
+namespace TisaiMultipath;
 class Program
 {
 

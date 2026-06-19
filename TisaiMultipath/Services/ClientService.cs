@@ -1,5 +1,5 @@
-﻿using MultiPathSingularity.Helpers;
-using MultiPathSingularity.Models;
+﻿using TisaiMultipath.Helpers;
+using TisaiMultipath.Models;
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
@@ -10,7 +10,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace MultiPathSingularity.Services
+namespace TisaiMultipath.Services
 {
     public static class ClientService
     {

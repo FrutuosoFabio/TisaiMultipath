@@ -1,4 +1,4 @@
-﻿using MultiPathSingularity.Services;
+﻿using TisaiMultipath.Services;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -8,7 +8,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace MultiPathSingularity.Models
+namespace TisaiMultipath.Models
 {
     public class Route
     {
