@@ -14,8 +14,8 @@ namespace TisaiMultipath.Services
     public static class ServerService
     {
         private static Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>? routes = new Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
-        private static UdpClient fwClient = new UdpClient(0);
-        private static UdpClient bckClient = new UdpClient(0);
+        private static UdpClient fwClient = Utils.CreateDualStackUdpClient(0);
+        private static UdpClient bckClient = Utils.CreateDualStackUdpClient(0);
         public static void StartServer(string port, string destination)
         {
             Console.WriteLine($"Starting server on port {port}... ");
@@ -50,24 +50,12 @@ namespace TisaiMultipath.Services
             }
         }
 
-        private static void TrySetLargeBuffers(UdpClient client)
-        {
-            try
-            {
-                client.Client.ReceiveBufferSize = 8 * 1024 * 1024;
-                client.Client.SendBufferSize = 8 * 1024 * 1024;
-            }
-            catch { }
-        }
-
         //Received from MP Client to Server
         private static void FwService(int port, string destination)
         {
             Console.WriteLine("[Server] FwService is running...");
 
-            fwClient = new UdpClient(port);
-            TrySetLargeBuffers(fwClient);
-            TrySetLargeBuffers(bckClient);
+            fwClient = Utils.CreateDualStackUdpClient(port);
 
             //Route and queue to send packets received from MP Client directly to Server
             BlockingCollection<(byte[], UdpClient?)> queue = new BlockingCollection<(byte[], UdpClient?)>();
@@ -87,15 +75,17 @@ namespace TisaiMultipath.Services
             {
                 try
                 {
-                    IPEndPoint _loopback = new IPEndPoint(IPAddress.Any, 0);
+                    // Socket dual-stack precisa IPv6Any aqui; IPv4 chega mapeado e e normalizado pra evitar duplicar Route.
+                    IPEndPoint _loopback = new IPEndPoint(IPAddress.IPv6Any, 0);
                     byte[] data = fwClient.Receive(ref _loopback);
-                                            
+                    IPAddress clientAddr = Utils.NormalizeAddress(_loopback.Address);
+
                     //Any new packet received should be registered to be used a route to send packets back through
-                    Route _route = new Route() { IPAddress = _loopback.Address, Port = _loopback.Port };
+                    Route _route = new Route() { IPAddress = clientAddr, Port = _loopback.Port };
                     if (!routes.ContainsKey(_route))
                     {
                         BlockingCollection<(byte[], UdpClient?)>? _queue = new BlockingCollection<(byte[], UdpClient?)>();
-                        routes.Add(new Route(_queue, null, fwClient) { IPAddress = _loopback.Address, Port = _loopback.Port }, _queue);
+                        routes.Add(new Route(_queue, null, fwClient) { IPAddress = clientAddr, Port = _loopback.Port }, _queue);
                     }
                     else
                     {
@@ -156,7 +146,7 @@ namespace TisaiMultipath.Services
             {
                 try
                 {
-                    IPEndPoint _loopback = new IPEndPoint(IPAddress.Any, 0);
+                    IPEndPoint _loopback = new IPEndPoint(IPAddress.IPv6Any, 0);
                     byte[] data = bckClient.Receive(ref _loopback);
 
                     //Send packet back through all routes that have connected to server

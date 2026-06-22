@@ -17,9 +17,13 @@ namespace TisaiMultipath.Services
         public static BlockingCollection<byte[]> bckQueue = new BlockingCollection<byte[]>();
         private static Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>> routes = new Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
         private static IPEndPoint? _bwEndpoint = null;
-        private static UdpClient fwClient = new UdpClient(0);
+        private static UdpClient fwClient = Utils.CreateDualStackUdpClient(0);
         public static int maxRoutes = 3;
         public static bool dynamicRoutes = true;
+
+        // Timeout maior pra desativar rota. Sob loss real (10-30%) + ping 500ms, basta 30s
+        // de silencio TOTAL pra considerar morta. Loss esporadico nao desativa mais.
+        private const double ROUTE_TIMEOUT_S = 30;
 
         public static void StartClient(string port, string routesFile, int routeControlPort = 12333)
         {
@@ -71,11 +75,10 @@ namespace TisaiMultipath.Services
 
         private static void CalculateDynamicRoutes()
         {
-            // 15s ao inves de 5s pra absorver janelas em que ping (1B) atrasa atras de
-            // rajadas WG sob trafego alto. Combinado com LastPing-em-qualquer-recv no Route,
-            // a rota so e considerada morta se realmente parar de receber qualquer pacote.
+            // Timeout 30s pra desativar rota — combinado com ping 500ms (3x mais probes)
+            // e EWMA de latency, rota so cai sob silencio realmente prolongado.
             int idx = 0;
-            foreach (Route route in routes.Keys.OrderBy(r => (DateTime.UtcNow - r.LastPing).TotalSeconds > 15 ? 999 : r.Latency))
+            foreach (Route route in routes.Keys.OrderBy(r => (DateTime.UtcNow - r.LastPing).TotalSeconds > ROUTE_TIMEOUT_S ? 999 : r.Latency))
             {
                 if (idx < maxRoutes)
                 {
@@ -89,22 +92,11 @@ namespace TisaiMultipath.Services
             }
         }
 
-        private static void TrySetLargeBuffers(UdpClient client)
-        {
-            try
-            {
-                client.Client.ReceiveBufferSize = 8 * 1024 * 1024;
-                client.Client.SendBufferSize = 8 * 1024 * 1024;
-            }
-            catch { }
-        }
-
         //Receive commands on Route Control Port
         private static void RouteControlService(int port)
         {
             Console.WriteLine("[Client] Route Control is running...");
-            UdpClient rcClient = new UdpClient(port);
-            TrySetLargeBuffers(rcClient);
+            UdpClient rcClient = Utils.CreateDualStackUdpClient(port);
 
             while (true)
             {
@@ -183,8 +175,7 @@ namespace TisaiMultipath.Services
         private static void FwService(int port)
         {
             Console.WriteLine("[Client] FwService is running...");
-            fwClient = new UdpClient(port);
-            TrySetLargeBuffers(fwClient);
+            fwClient = Utils.CreateDualStackUdpClient(port);
 
             while (true)
             {

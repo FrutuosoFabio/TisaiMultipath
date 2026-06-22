@@ -1,4 +1,5 @@
-﻿using TisaiMultipath.Services;
+using TisaiMultipath.Helpers;
+using TisaiMultipath.Services;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -12,20 +13,23 @@ namespace TisaiMultipath.Models
 {
     public class Route
     {
+        // Ping a cada 500ms — 3x mais probes que o original (1500ms).
+        // Sob 30% loss, P(2 perdidos seguidos)=0.09 vs 0.3 do ping 1500ms; rota sobrevive a microblips.
+        public const int PING_INTERVAL_MS = 500;
+
+        // Renovacao do socket so se REALMENTE morto (30s sem qualquer recv).
+        public const double SOCKET_RENEWAL_TIMEOUT_S = 30;
+
         public Route()
         {
-
         }
 
         public Route(BlockingCollection<(byte[], UdpClient?)>? queue, BlockingCollection<byte[]>? bckQueue = null, UdpClient? udpClient = null)
         {
-            // Buffer alto evita kernel-drop dos pings quando rajada de WG enche o socket queue.
-            TrySetLargeBuffers(_routeUdp);
-
             if (queue != null)
                 Task.Run(() => WorkerThread(queue));
 
-            if(bckQueue != null)
+            if (bckQueue != null)
             {
                 listenerTask = Task.Run(() => UdpThread(bckQueue));
                 _bckQueue = bckQueue;
@@ -40,7 +44,7 @@ namespace TisaiMultipath.Models
             //If any task is running, start latency thread
             if (bckQueue != null || queue != null)
             {
-                if(udpClient != null)
+                if (udpClient != null)
                     Task.Run(() => LatencyThread(ref udpClient));
                 else
                     Task.Run(() => LatencyThread(ref _routeUdp));
@@ -56,7 +60,7 @@ namespace TisaiMultipath.Models
         private byte latencyIdx = 0;
         private DateTime latencyStart = DateTime.UtcNow;
 
-        private UdpClient _routeUdp = new UdpClient(0);
+        private UdpClient _routeUdp = Utils.CreateDualStackUdpClient(0);
         private UdpClient _udpClient;
         private bool canRenewRoute = false;
         private Task listenerTask;
@@ -95,7 +99,8 @@ namespace TisaiMultipath.Models
         {
             while (true)
             {
-                IPEndPoint _loopback = new IPEndPoint(IPAddress.Any, 0);
+                // Socket dual-stack precisa de IPv6Any aqui — IPv4 chega como ::ffff:1.2.3.4 mapeado.
+                IPEndPoint _loopback = new IPEndPoint(IPAddress.IPv6Any, 0);
                 byte[] data = _routeUdp.Receive(ref _loopback);
 
                 // Qualquer pacote recebido = rota viva. Sob trafego alto o ping (1B) entra
@@ -120,22 +125,13 @@ namespace TisaiMultipath.Models
             }
         }
 
-        private static void TrySetLargeBuffers(UdpClient client)
-        {
-            try
-            {
-                client.Client.ReceiveBufferSize = 8 * 1024 * 1024;
-                client.Client.SendBufferSize = 8 * 1024 * 1024;
-            }
-            catch { /* SO pode limitar; default e aceitavel */ }
-        }
-
         public void SetActive(bool _active)
         {
             active = _active;
 
 
-            switch(active) { 
+            switch (active)
+            {
                 case true:
                     _routeUdp.Send(new byte[] { 0, 0, 1 }, 3, new IPEndPoint(IPAddress, Port));
                     Console.WriteLine($"Disabling route: {IPAddress}:{Port}");
@@ -149,13 +145,13 @@ namespace TisaiMultipath.Models
 
         public void SetRouteActive(byte a)
         {
-            switch(a)
+            switch (a)
             {
                 case 0:
                     active = false;
                     Console.WriteLine($"Disabling route: {IPAddress}:{Port}");
                     break;
-                case 1: 
+                case 1:
                     active = true;
                     Console.WriteLine($"Enabling route: {IPAddress}:{Port}");
                     break;
@@ -168,20 +164,19 @@ namespace TisaiMultipath.Models
             {
                 client.Send(new byte[] { ++latencyIdx, 0 }, 2, new IPEndPoint(IPAddress, Port));
 
-                if(_udpClient is null) //If running as a client
+                if (_udpClient is null) //If running as a client
                     client.Send(new byte[] { 0, 0, (active ? (byte)1 : (byte)0) }, 3, new IPEndPoint(IPAddress, Port)); //Keeps route state synchronized on server
 
 
                 latencyStart = DateTime.UtcNow;
 
-                Thread.Sleep(1500);
+                Thread.Sleep(PING_INTERVAL_MS);
 
-                if(canRenewRoute && (DateTime.UtcNow - LastPing).TotalSeconds > 30)
+                if (canRenewRoute && (DateTime.UtcNow - LastPing).TotalSeconds > SOCKET_RENEWAL_TIMEOUT_S)
                 {
                     lock (_udpLock)
                     {
-                        client = new UdpClient(0);
-                        TrySetLargeBuffers(client);
+                        client = Utils.CreateDualStackUdpClient(0);
 
                         if (_bckQueue != null)
                         {
@@ -195,13 +190,20 @@ namespace TisaiMultipath.Models
             }
         }
 
+        // Recebeu pong (1B). Sempre atualiza LastPing (mantem rota viva mesmo se pong fora
+        // de ordem). Latency suavizada via EWMA pra nao saltar pra 999 em uma perda singular.
         public void CalculateLatency(byte idx)
         {
-            if (idx != latencyIdx)
-                return;
-
-            Latency = (DateTime.UtcNow - latencyStart).TotalMilliseconds;
             LastPing = DateTime.UtcNow;
+
+            if (idx != latencyIdx)
+                return; // pong de probe antigo — heartbeat conta, mas nao usa pra calc RTT
+
+            double sample = (DateTime.UtcNow - latencyStart).TotalMilliseconds;
+
+            // Primeiro sample inicializa direto. Depois EWMA 70/30 — picos suavizam,
+            // perdas pontuais nao destroem a metrica.
+            Latency = (Latency >= 999) ? sample : (Latency * 0.7 + sample * 0.3);
         }
 
         //The following 2 methods (Equals and GetHashCode) ensure that this class can be compared using IPAddress and Port only ignoring everything else.

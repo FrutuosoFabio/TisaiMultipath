@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>TisaiMultipath</RootNamespace>
     <AssemblyName>TisaiMultipath</AssemblyName>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>TisaiLag (fork of vinivyes/Wireguard-Multipath)</Authors>
     <Description>Multi-path UDP duplication for WireGuard tunnels. Fork of Wireguard-Multipath under GPL-3.0.</Description>
   </PropertyGroup>
