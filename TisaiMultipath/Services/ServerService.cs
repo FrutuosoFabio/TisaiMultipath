@@ -154,41 +154,54 @@ namespace TisaiMultipath.Services
                         && data[0] == SEQ_MAGIC_HEAD
                         && data[5] == SEQ_MAGIC_TAIL)
                     {
-                        uint seq = ((uint)data[1] << 24) | ((uint)data[2] << 16) | ((uint)data[3] << 8) | (uint)data[4];
-                        bool isDup;
-                        lock (_recvSeqLock)
-                        {
-                            // 2-bucket: consulta os dois, insere no current.
-                            if (_recvSeqCurrent.Contains(seq) || _recvSeqPrevious.Contains(seq))
-                            {
-                                isDup = true;
-                            }
-                            else
-                            {
-                                isDup = false;
-                                _recvSeqCurrent.Add(seq);
-                                // Rotacao: current cheio -> vira previous, novo current vazio.
-                                // Janela efetiva 4096-8192 seqs (~64-128s a 64pps), sem flush
-                                // total -> sem janela de race apos o cleanup.
-                                if (_recvSeqCurrent.Count > RECV_SEQ_WINDOW)
-                                {
-                                    _recvSeqPrevious = _recvSeqCurrent;
-                                    _recvSeqCurrent = new HashSet<uint>();
-                                }
-                            }
-                        }
+                        // Tipo da msg WG vem logo APÓS o header seq de 6 bytes:
+                        // 1=handshake init, 2=handshake response, 3=cookie reply, 4=transport data.
+                        byte wgType = data.Length > SEQ_HEADER_SIZE ? data[SEQ_HEADER_SIZE] : (byte)0;
+                        bool isHandshake = wgType >= 1 && wgType <= 3;
 
                         // Marca este route como falando seq → respostas vão com header
                         Route? rt = routes.Keys.FirstOrDefault(r => r.Equals(_route));
                         if (rt != null) rt.UsesSeq = true;
 
-                        if (isDup)
+                        // HANDSHAKE NUNCA é deduplicado: forwarda TODA cópia pro WG. Handshake é
+                        // raro (rekey ~120s) e perder 1 = stall fixo de 5s no WG (pior em link
+                        // móvel/lossy). Deduplicar tiraria a redundância multipath justo aí.
+                        // Só transporte (tipo 4) entra no dedup.
+                        if (!isHandshake)
                         {
-                            Interlocked.Increment(ref _totalSeqDeduped);
-                            continue; // descarta duplicata, não forwarda
+                            uint seq = ((uint)data[1] << 24) | ((uint)data[2] << 16) | ((uint)data[3] << 8) | (uint)data[4];
+                            bool isDup;
+                            lock (_recvSeqLock)
+                            {
+                                // 2-bucket: consulta os dois, insere no current.
+                                if (_recvSeqCurrent.Contains(seq) || _recvSeqPrevious.Contains(seq))
+                                {
+                                    isDup = true;
+                                }
+                                else
+                                {
+                                    isDup = false;
+                                    _recvSeqCurrent.Add(seq);
+                                    // Rotacao: current cheio -> vira previous, novo current vazio.
+                                    // Janela efetiva 4096-8192 seqs (~64-128s a 64pps), sem flush
+                                    // total -> sem janela de race apos o cleanup.
+                                    if (_recvSeqCurrent.Count > RECV_SEQ_WINDOW)
+                                    {
+                                        _recvSeqPrevious = _recvSeqCurrent;
+                                        _recvSeqCurrent = new HashSet<uint>();
+                                    }
+                                }
+                            }
+
+                            if (isDup)
+                            {
+                                Interlocked.Increment(ref _totalSeqDeduped);
+                                continue; // descarta duplicata, não forwarda
+                            }
+                            Interlocked.Increment(ref _totalSeqPassed);
                         }
-                        Interlocked.Increment(ref _totalSeqPassed);
-                        // Strip 6-byte header antes de entregar ao WG kernel
+
+                        // Strip 6-byte header antes de entregar ao WG kernel (handshake e dado)
                         payload = new byte[data.Length - SEQ_HEADER_SIZE];
                         Buffer.BlockCopy(data, SEQ_HEADER_SIZE, payload, 0, payload.Length);
                     }
@@ -223,9 +236,16 @@ namespace TisaiMultipath.Services
                     IPEndPoint _loopback = new IPEndPoint(IPAddress.IPv6Any, 0);
                     byte[] data = bckClient.Receive(ref _loopback);
 
-                    // Pre-build versão seq-encoded (uma vez por pacote, reusada em rotas seq)
+                    // data[0] = tipo da msg WG (kernel manda cru): 1/2/3 = handshake, 4 = dado.
+                    byte wgType = data.Length > 0 ? data[0] : (byte)0;
+                    bool isHandshake = wgType >= 1 && wgType <= 3;
+
+                    // HANDSHAKE volta RAW (sem header seq): o cliente, sem o magic, entrega direto
+                    // ao WG sem deduplicar → toda cópia (todas as rotas) chega no WG. Redundância
+                    // máxima no rekey. Não incrementa _serverSeq (mantém a sequência de dados
+                    // contígua p/ o gap-tracking do cliente).
                     byte[]? seqData = null;
-                    if (_seqEnabled)
+                    if (_seqEnabled && !isHandshake)
                     {
                         uint seq = Interlocked.Increment(ref _serverSeq);
                         seqData = new byte[data.Length + SEQ_HEADER_SIZE];
@@ -239,10 +259,10 @@ namespace TisaiMultipath.Services
                     }
 
                     //Send packet back through all routes that have connected to server.
-                    //Per-route: routes que falaram seq recebem versão seq-encoded; legacy recebe raw.
+                    //Per-route: routes que falaram seq recebem versão seq-encoded; handshake e legacy recebem raw.
                     foreach (var route in routes)
                     {
-                        byte[] toSend = (_seqEnabled && route.Key.UsesSeq && seqData != null) ? seqData : data;
+                        byte[] toSend = (_seqEnabled && !isHandshake && route.Key.UsesSeq && seqData != null) ? seqData : data;
                         route.Value.Add((toSend, fwClient));
                     }
                 }
