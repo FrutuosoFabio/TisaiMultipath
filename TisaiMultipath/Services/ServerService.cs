@@ -28,7 +28,12 @@ namespace TisaiMultipath.Services
         private const int RECV_SEQ_WINDOW = 4096;
         private static bool _seqEnabled = false;
         private static uint _serverSeq = 0;
-        private static readonly HashSet<uint> _recvSeenSeqs = new HashSet<uint>();
+        // 2-bucket rotation pro dedup do uplink: sem Clear() total, que abria janela
+        // de race (a 2a copia chegando logo apos o flush era marcada como "nova",
+        // forwardada pro WG e descartada pelo anti-replay -> OOO contado como loss no
+        // jogo). Mesmo fix aplicado no cliente (MultipathRouterService 2-bucket).
+        private static HashSet<uint> _recvSeqCurrent = new HashSet<uint>();
+        private static HashSet<uint> _recvSeqPrevious = new HashSet<uint>();
         private static readonly object _recvSeqLock = new object();
         private static long _totalSeqDeduped = 0;
         private static long _totalSeqPassed = 0;
@@ -153,16 +158,23 @@ namespace TisaiMultipath.Services
                         bool isDup;
                         lock (_recvSeqLock)
                         {
-                            if (_recvSeenSeqs.Contains(seq))
+                            // 2-bucket: consulta os dois, insere no current.
+                            if (_recvSeqCurrent.Contains(seq) || _recvSeqPrevious.Contains(seq))
                             {
                                 isDup = true;
                             }
                             else
                             {
                                 isDup = false;
-                                _recvSeenSeqs.Add(seq);
-                                // Cleanup janela: limpa tudo quando enche (~4096 seqs ≈ 64s a 64pps)
-                                if (_recvSeenSeqs.Count > RECV_SEQ_WINDOW) _recvSeenSeqs.Clear();
+                                _recvSeqCurrent.Add(seq);
+                                // Rotacao: current cheio -> vira previous, novo current vazio.
+                                // Janela efetiva 4096-8192 seqs (~64-128s a 64pps), sem flush
+                                // total -> sem janela de race apos o cleanup.
+                                if (_recvSeqCurrent.Count > RECV_SEQ_WINDOW)
+                                {
+                                    _recvSeqPrevious = _recvSeqCurrent;
+                                    _recvSeqCurrent = new HashSet<uint>();
+                                }
                             }
                         }
 
