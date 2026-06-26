@@ -68,6 +68,13 @@ namespace TisaiMultipath.Models
 
         public bool active { get; set; } = true;
 
+        /// <summary>
+        /// Cliente neste route fala protocolo seq (header 0xAA+seq4+0x55). Marcado true
+        /// na 1a incoming com magic detectado. Server usa pra decidir se adiciona seq
+        /// header na resposta — clientes legacy continuam recebendo bytes raw.
+        /// </summary>
+        public bool UsesSeq { get; set; } = false;
+
         private readonly object _udpLock = new object();
 
         private void WorkerThread(BlockingCollection<(byte[], UdpClient?)> queue)
@@ -145,17 +152,18 @@ namespace TisaiMultipath.Models
 
         public void SetRouteActive(byte a)
         {
-            switch (a)
-            {
-                case 0:
-                    active = false;
-                    Console.WriteLine($"Disabling route: {IPAddress}:{Port}");
-                    break;
-                case 1:
-                    active = true;
-                    Console.WriteLine($"Enabling route: {IPAddress}:{Port}");
-                    break;
-            }
+            // Control packet de 3 bytes e reenviado pelo client como keepalive (~1.5s/rota,
+            // x copias multipath). IDEMPOTENTE: so age/loga quando o estado MUDA. Sem isso,
+            // o server "habilitava" uma rota ja ativa dezenas de vezes/s — log spam +
+            // scan/thrash na thread unica do FwService (mesma que processa handshake).
+            if (a != 0 && a != 1) return;          // fora do protocolo
+            bool newActive = a == 1;
+            if (active == newActive) return;       // sem mudanca -> no-op
+
+            active = newActive;
+            Console.WriteLine(newActive
+                ? $"Enabling route: {IPAddress}:{Port}"
+                : $"Disabling route: {IPAddress}:{Port}");
         }
 
         private void LatencyThread(ref UdpClient client)

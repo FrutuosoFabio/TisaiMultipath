@@ -28,11 +28,16 @@ class Program
                 case "server":
                     if (args.Length < a + 2)
                     {
-                        Console.WriteLine("Server is missing arguments.\nUsage: mpsingularity server <PORT> \"1.2.3.4:1234\"");
+                        Console.WriteLine("Server is missing arguments.\nUsage: mpsingularity server <PORT> \"1.2.3.4:1234\" [--seq]");
                         Environment.Exit(12);
                     }
-                    
-                    ServerService.StartServer(args[a + 1], args[a + 2]);
+
+                    // --seq habilita dedup bidirecional por header magic (0xAA+seq4+0x55).
+                    // Usado na ponta SP (wg-orcsp1/wg-akm) onde 2+ paths convergem.
+                    // MAO PoP hops (wg-tim) NAO precisam — deixa flag off pra forward as-is.
+                    bool seqEnabled = args.Skip(a).Any(x => x == "--seq");
+
+                    ServerService.StartServer(args[a + 1], args[a + 2], seqEnabled);
                     a = a + 2;
                     s++;
                     break;
