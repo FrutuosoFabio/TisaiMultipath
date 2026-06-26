@@ -28,12 +28,21 @@ namespace TisaiMultipath.Services
         private const int RECV_SEQ_WINDOW = 4096;
         private static bool _seqEnabled = false;
         private static uint _serverSeq = 0;
-        // 2-bucket rotation pro dedup do uplink: sem Clear() total, que abria janela
-        // de race (a 2a copia chegando logo apos o flush era marcada como "nova",
-        // forwardada pro WG e descartada pelo anti-replay -> OOO contado como loss no
-        // jogo). Mesmo fix aplicado no cliente (MultipathRouterService 2-bucket).
-        private static HashSet<uint> _recvSeqCurrent = new HashSet<uint>();
-        private static HashSet<uint> _recvSeqPrevious = new HashSet<uint>();
+
+        // Janela de dedup do uplink, 2-bucket rotation (sem Clear() total, que abria
+        // janela de race -> OOO; mesmo fix do cliente MultipathRouterService).
+        private sealed class SeqWindow
+        {
+            public HashSet<uint> Current = new HashSet<uint>();
+            public HashSet<uint> Previous = new HashSet<uint>();
+            public DateTime LastSeen = DateTime.UtcNow;
+        }
+        // Dedup POR SESSAO WG (receiver_index), NAO global. Cada cliente tem seq
+        // proprio comecando em 0; uma janela global faria o seq=N do cliente B ser
+        // visto como duplicata do seq=N do cliente A -> drop de pacote legitimo.
+        // As copias multipath do MESMO cliente compartilham o receiver_index (e o
+        // seq), entao casam na mesma janela; clientes distintos tem indices distintos.
+        private static readonly Dictionary<uint, SeqWindow> _seqWindows = new Dictionary<uint, SeqWindow>();
         private static readonly object _recvSeqLock = new object();
         private static long _totalSeqDeduped = 0;
         private static long _totalSeqPassed = 0;
@@ -69,6 +78,18 @@ namespace TisaiMultipath.Services
                     if((DateTime.UtcNow - r.LastPing).TotalSeconds > 15)
                     {
                         routes.Remove(r);
+                    }
+                }
+
+                // Poda janelas de dedup de sessoes WG inativas (>60s) — evita vazar
+                // memoria com receiver_index velhos (rekey cria indice novo).
+                lock (_recvSeqLock)
+                {
+                    foreach (var idx in _seqWindows
+                                 .Where(kv => (DateTime.UtcNow - kv.Value.LastSeen).TotalSeconds > 60)
+                                 .Select(kv => kv.Key).ToList())
+                    {
+                        _seqWindows.Remove(idx);
                     }
                 }
             }
@@ -170,25 +191,44 @@ namespace TisaiMultipath.Services
                         if (!isHandshake)
                         {
                             uint seq = ((uint)data[1] << 24) | ((uint)data[2] << 16) | ((uint)data[3] << 8) | (uint)data[4];
+
+                            // receiver_index do WG (u32 little-endian no offset 4 do pacote WG,
+                            // que comeca apos o header seq) identifica a sessao/cliente. Dedup
+                            // por sessao evita colisao de seq entre clientes distintos.
+                            uint session = 0;
+                            int wgOff = SEQ_HEADER_SIZE;
+                            if (data.Length >= wgOff + 8)
+                                session = (uint)data[wgOff + 4]
+                                        | ((uint)data[wgOff + 5] << 8)
+                                        | ((uint)data[wgOff + 6] << 16)
+                                        | ((uint)data[wgOff + 7] << 24);
+
                             bool isDup;
                             lock (_recvSeqLock)
                             {
+                                if (!_seqWindows.TryGetValue(session, out var w))
+                                {
+                                    w = new SeqWindow();
+                                    _seqWindows[session] = w;
+                                }
+                                w.LastSeen = DateTime.UtcNow;
+
                                 // 2-bucket: consulta os dois, insere no current.
-                                if (_recvSeqCurrent.Contains(seq) || _recvSeqPrevious.Contains(seq))
+                                if (w.Current.Contains(seq) || w.Previous.Contains(seq))
                                 {
                                     isDup = true;
                                 }
                                 else
                                 {
                                     isDup = false;
-                                    _recvSeqCurrent.Add(seq);
+                                    w.Current.Add(seq);
                                     // Rotacao: current cheio -> vira previous, novo current vazio.
                                     // Janela efetiva 4096-8192 seqs (~64-128s a 64pps), sem flush
                                     // total -> sem janela de race apos o cleanup.
-                                    if (_recvSeqCurrent.Count > RECV_SEQ_WINDOW)
+                                    if (w.Current.Count > RECV_SEQ_WINDOW)
                                     {
-                                        _recvSeqPrevious = _recvSeqCurrent;
-                                        _recvSeqCurrent = new HashSet<uint>();
+                                        w.Previous = w.Current;
+                                        w.Current = new HashSet<uint>();
                                     }
                                 }
                             }
