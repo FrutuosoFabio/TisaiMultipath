@@ -13,7 +13,13 @@ namespace TisaiMultipath.Services
 {
     public static class ServerService
     {
-        private static Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>? routes = new Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
+        // ConcurrentDictionary (NÃO Dictionary): routes é tocado por 3 threads —
+        // FwService (TryAdd), StartServer (TryRemove ao expirar) e BckService (foreach).
+        // Com Dictionary sem lock, o churn de reconexão (disconnect/reconnect) causava
+        // "Collection was modified" no foreach do BckService (dropava a resposta do WG)
+        // ou corrompia o dict → retorno travava PERMANENTE até restart. ConcurrentDictionary
+        // tem iteração snapshot (não lança) e Add/Remove atômicos.
+        private static ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>? routes = new ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
         private static UdpClient fwClient = Utils.CreateDualStackUdpClient(0);
         private static UdpClient bckClient = Utils.CreateDualStackUdpClient(0);
 
@@ -63,7 +69,7 @@ namespace TisaiMultipath.Services
                 );
 
             if (routes == null)
-                routes = new Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
+                routes = new ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
 
             Utils.PrintRouteStates(routes.Keys.ToList() ?? new List<Route>(), false);
             while (true)
@@ -77,7 +83,7 @@ namespace TisaiMultipath.Services
                 {
                     if((DateTime.UtcNow - r.LastPing).TotalSeconds > 15)
                     {
-                        routes.Remove(r);
+                        routes.TryRemove(r, out _);
                     }
                 }
 
@@ -114,7 +120,7 @@ namespace TisaiMultipath.Services
 
             //Initialize routes - Error check for null
             if (routes == null)
-                routes = new Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
+                routes = new ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
 
             while (true)
             {
@@ -130,7 +136,7 @@ namespace TisaiMultipath.Services
                     if (!routes.ContainsKey(_route))
                     {
                         BlockingCollection<(byte[], UdpClient?)>? _queue = new BlockingCollection<(byte[], UdpClient?)>();
-                        routes.Add(new Route(_queue, null, fwClient) { IPAddress = clientAddr, Port = _loopback.Port }, _queue);
+                        routes.TryAdd(new Route(_queue, null, fwClient) { IPAddress = clientAddr, Port = _loopback.Port }, _queue);
                     }
                     else
                     {
@@ -267,7 +273,7 @@ namespace TisaiMultipath.Services
 
             //Initialize routes - Error check for null
             if (routes == null)
-                routes = new Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
+                routes = new ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
 
             while (true)
             {
