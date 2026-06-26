@@ -16,9 +16,28 @@ namespace TisaiMultipath.Services
         private static Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>? routes = new Dictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
         private static UdpClient fwClient = Utils.CreateDualStackUdpClient(0);
         private static UdpClient bckClient = Utils.CreateDualStackUdpClient(0);
-        public static void StartServer(string port, string destination)
+
+        // -------- Seq dedup protocol (header de 6 bytes prepended pelos clientes) --------
+        // Formato: [0xAA][seq3][seq2][seq1][seq0][0x55] + payload WG. Ver MULTIPATH-SEQ-DEDUP.md.
+        // Server na ponta SP dedupe por seq + strip header antes de forwardar pro WG kernel.
+        // Na resposta, server adiciona NOVO header (com _serverSeq incremental).
+        // MAO PoP hops NAO precisam — desativa via SeqEnabled=false (forward as-is).
+        private const byte SEQ_MAGIC_HEAD = 0xAA;
+        private const byte SEQ_MAGIC_TAIL = 0x55;
+        private const int SEQ_HEADER_SIZE = 6;
+        private const int RECV_SEQ_WINDOW = 4096;
+        private static bool _seqEnabled = false;
+        private static uint _serverSeq = 0;
+        private static readonly HashSet<uint> _recvSeenSeqs = new HashSet<uint>();
+        private static readonly object _recvSeqLock = new object();
+        private static long _totalSeqDeduped = 0;
+        private static long _totalSeqPassed = 0;
+        private static long _totalLegacy = 0;
+
+        public static void StartServer(string port, string destination, bool seqEnabled = false)
         {
-            Console.WriteLine($"Starting server on port {port}... ");
+            _seqEnabled = seqEnabled;
+            Console.WriteLine($"Starting server on port {port}... seqDedup={(seqEnabled ? "ON" : "OFF")}");
 
             _ = Task.Run(() =>
                     FwService(int.Parse(port), destination)
@@ -119,12 +138,55 @@ namespace TisaiMultipath.Services
                         Route? r = routes.Keys.FirstOrDefault(r => r.Equals(_route));
                         if (r == null)
                             continue;
-                        
+
                         r.CalculateLatency(data[0]);
                     }
 
+                    // -------- SEQ DEDUP (se ativado e header magic detectado) --------
+                    byte[] payload = data;
+                    if (_seqEnabled
+                        && data.Length >= SEQ_HEADER_SIZE
+                        && data[0] == SEQ_MAGIC_HEAD
+                        && data[5] == SEQ_MAGIC_TAIL)
+                    {
+                        uint seq = ((uint)data[1] << 24) | ((uint)data[2] << 16) | ((uint)data[3] << 8) | (uint)data[4];
+                        bool isDup;
+                        lock (_recvSeqLock)
+                        {
+                            if (_recvSeenSeqs.Contains(seq))
+                            {
+                                isDup = true;
+                            }
+                            else
+                            {
+                                isDup = false;
+                                _recvSeenSeqs.Add(seq);
+                                // Cleanup janela: limpa tudo quando enche (~4096 seqs ≈ 64s a 64pps)
+                                if (_recvSeenSeqs.Count > RECV_SEQ_WINDOW) _recvSeenSeqs.Clear();
+                            }
+                        }
+
+                        // Marca este route como falando seq → respostas vão com header
+                        Route? rt = routes.Keys.FirstOrDefault(r => r.Equals(_route));
+                        if (rt != null) rt.UsesSeq = true;
+
+                        if (isDup)
+                        {
+                            Interlocked.Increment(ref _totalSeqDeduped);
+                            continue; // descarta duplicata, não forwarda
+                        }
+                        Interlocked.Increment(ref _totalSeqPassed);
+                        // Strip 6-byte header antes de entregar ao WG kernel
+                        payload = new byte[data.Length - SEQ_HEADER_SIZE];
+                        Buffer.BlockCopy(data, SEQ_HEADER_SIZE, payload, 0, payload.Length);
+                    }
+                    else if (_seqEnabled)
+                    {
+                        Interlocked.Increment(ref _totalLegacy);
+                    }
+
                     //Use Destination queue to finish delivery of packet to Server
-                    queue.Add((data, bckClient));
+                    queue.Add((payload, bckClient));
                 }
                 catch(Exception ex)
                 {
@@ -149,10 +211,27 @@ namespace TisaiMultipath.Services
                     IPEndPoint _loopback = new IPEndPoint(IPAddress.IPv6Any, 0);
                     byte[] data = bckClient.Receive(ref _loopback);
 
-                    //Send packet back through all routes that have connected to server
+                    // Pre-build versão seq-encoded (uma vez por pacote, reusada em rotas seq)
+                    byte[]? seqData = null;
+                    if (_seqEnabled)
+                    {
+                        uint seq = Interlocked.Increment(ref _serverSeq);
+                        seqData = new byte[data.Length + SEQ_HEADER_SIZE];
+                        seqData[0] = SEQ_MAGIC_HEAD;
+                        seqData[1] = (byte)((seq >> 24) & 0xFF);
+                        seqData[2] = (byte)((seq >> 16) & 0xFF);
+                        seqData[3] = (byte)((seq >> 8) & 0xFF);
+                        seqData[4] = (byte)(seq & 0xFF);
+                        seqData[5] = SEQ_MAGIC_TAIL;
+                        Buffer.BlockCopy(data, 0, seqData, SEQ_HEADER_SIZE, data.Length);
+                    }
+
+                    //Send packet back through all routes that have connected to server.
+                    //Per-route: routes que falaram seq recebem versão seq-encoded; legacy recebe raw.
                     foreach (var route in routes)
                     {
-                        route.Value.Add((data, fwClient));
+                        byte[] toSend = (_seqEnabled && route.Key.UsesSeq && seqData != null) ? seqData : data;
+                        route.Value.Add((toSend, fwClient));
                     }
                 }
                 catch(Exception ex)

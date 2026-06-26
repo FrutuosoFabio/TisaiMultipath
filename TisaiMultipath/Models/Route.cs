@@ -68,6 +68,13 @@ namespace TisaiMultipath.Models
 
         public bool active { get; set; } = true;
 
+        /// <summary>
+        /// Cliente neste route fala protocolo seq (header 0xAA+seq4+0x55). Marcado true
+        /// na 1a incoming com magic detectado. Server usa pra decidir se adiciona seq
+        /// header na resposta — clientes legacy continuam recebendo bytes raw.
+        /// </summary>
+        public bool UsesSeq { get; set; } = false;
+
         private readonly object _udpLock = new object();
 
         private void WorkerThread(BlockingCollection<(byte[], UdpClient?)> queue)
