@@ -31,6 +31,9 @@ namespace TisaiMultipath.Services
         private static UdpClient fwClient = Utils.CreateDualStackUdpClient(0);
         private static UdpClient bckClient = Utils.CreateDualStackUdpClient(0);
 
+        // Destino do forward (WG/next hop), parseado 1x — FwService envia inline pra cá.
+        private static IPEndPoint? _destEndpoint;
+
         // -------- Seq dedup protocol (header de 6 bytes prepended pelos clientes) --------
         // Formato: [0xAA][seq3][seq2][seq1][seq0][0x55] + payload WG. Ver MULTIPATH-SEQ-DEDUP.md.
         // Server na ponta SP dedupe por seq + strip header antes de forwardar pro WG kernel.
@@ -72,7 +75,24 @@ namespace TisaiMultipath.Services
             // (sem prender workers -> sem starvation). Continua Task -> exceção não-tratada
             // falha a task silenciosa, NÃO derruba o processo (new Thread crashava via
             // EINVAL no LatencyThread em hosts com loopback dual-stack diferente, ex akm).
-            Task.Factory.StartNew(() => FwService(int.Parse(port), destination), TaskCreationOptions.LongRunning);
+            // DEST parseado uma vez (forward inline, sem re-resolver por pacote).
+            _destEndpoint = IPEndPoint.Parse(destination);
+
+            // N threads de RECEIVE com SO_REUSEPORT (kernel balanceia por fluxo -> escala com
+            // cores). Cada cliente (4-tupla fixa) cai sempre na MESMA thread -> estado por-cliente
+            // (Route) é single-thread; só os dicts compartilhados precisam ser thread-safe (já são).
+            // socks[0] = socket de RETORNO (BckService/LatencyThread enviam respostas por ele).
+            // N = nº de cores (1 vCPU -> 1 thread, sem regressão); override via TISAI_FW_THREADS.
+            int fwThreads = Math.Max(1, Environment.ProcessorCount);
+            if (int.TryParse(Environment.GetEnvironmentVariable("TISAI_FW_THREADS"), out int envT) && envT > 0)
+                fwThreads = envT;
+            Console.WriteLine($"FwService: {fwThreads} thread(s) SO_REUSEPORT na porta {port}");
+            for (int i = 0; i < fwThreads; i++)
+            {
+                var sock = Utils.CreateReusePortUdpClient(int.Parse(port));
+                if (i == 0) fwClient = sock;
+                Task.Factory.StartNew(() => FwService(sock), TaskCreationOptions.LongRunning);
+            }
 
             Task.Factory.StartNew(() => BckService(), TaskCreationOptions.LongRunning);
 
@@ -110,22 +130,10 @@ namespace TisaiMultipath.Services
             }
         }
 
-        //Received from MP Client to Server
-        private static void FwService(int port, string destination)
+        //Received from MP Client to Server. UMA instância por thread SO_REUSEPORT (recvSocket).
+        private static void FwService(UdpClient recvSocket)
         {
-            Console.WriteLine("[Server] FwService is running...");
-
-            fwClient = Utils.CreateDualStackUdpClient(port);
-
-            //Route and queue to send packets received from MP Client directly to Server
-            BlockingCollection<(byte[], UdpClient?)> queue = new BlockingCollection<(byte[], UdpClient?)>();
-            Route? route = Utils.ReadRoute(destination, queue);
-
-            if(route == null)
-            {
-                Console.WriteLine("Missing destination route.\nUsage: mpsingularity server <PORT> \"1.2.3.4:1234\"");
-                Environment.Exit(11);
-            }
+            Console.WriteLine("[Server] FwService thread is running...");
 
             //Initialize routes - Error check for null
             if (routes == null)
@@ -137,7 +145,7 @@ namespace TisaiMultipath.Services
                 {
                     // Socket dual-stack precisa IPv6Any aqui; IPv4 chega mapeado e e normalizado pra evitar duplicar Route.
                     IPEndPoint _loopback = new IPEndPoint(IPAddress.IPv6Any, 0);
-                    byte[] data = fwClient.Receive(ref _loopback);
+                    byte[] data = recvSocket.Receive(ref _loopback);
                     IPAddress clientAddr = Utils.NormalizeAddress(_loopback.Address);
 
                     //Any new packet received should be registered to be used a route to send packets back through
@@ -163,7 +171,7 @@ namespace TisaiMultipath.Services
                     //Ping Packets will be bounced back - Wireguard Packets (and most regular packets) will always be larger than 2 byte
                     if (data.Length == 2)
                     {
-                        fwClient.Send(data.Take(1).ToArray(), 1, _loopback);
+                        recvSocket.Send(data.Take(1).ToArray(), 1, _loopback);
                         continue;
                     }
 
@@ -253,8 +261,11 @@ namespace TisaiMultipath.Services
                         Interlocked.Increment(ref _totalLegacy);
                     }
 
-                    //Use Destination queue to finish delivery of packet to Server
-                    queue.Add((payload, bckClient));
+                    // FORWARD INLINE pro DEST via bckClient (era queue.Add -> 1 WorkerThread
+                    // único drenando = gargalo de envio single-thread; agora cada thread
+                    // FwService envia direto, em paralelo. sendto concorrente no mesmo socket
+                    // é thread-safe). bckClient recebe o downstream do WG -> BckService.
+                    bckClient.Send(payload, payload.Length, _destEndpoint!);
                 }
                 catch(Exception ex)
                 {

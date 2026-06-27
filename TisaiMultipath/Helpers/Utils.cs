@@ -29,6 +29,28 @@ namespace TisaiMultipath.Helpers
             return client;
         }
 
+        // Igual ao CreateDualStackUdpClient mas com SO_REUSEPORT — permite VÁRIAS threads
+        // bindarem a MESMA porta; o kernel balanceia os pacotes por fluxo (4-tupla src/dst)
+        // entre os sockets. Cada cliente (4-tupla fixa) cai SEMPRE no mesmo socket/thread,
+        // então o estado por-cliente continua single-thread (sem race). Destrava o FwService
+        // de "1 core fixo" pra "escala com nº de cores". Linux: SOL_SOCKET=1, SO_REUSEPORT=15
+        // — tem que ser setado ANTES do Bind.
+        public static UdpClient CreateReusePortUdpClient(int port)
+        {
+            var socket = new Socket(AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp);
+            try { socket.DualMode = true; } catch { }
+            try { socket.SetRawSocketOption(1, 15, BitConverter.GetBytes(1)); } catch { }
+            socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
+            var client = new UdpClient { Client = socket };
+            try
+            {
+                client.Client.ReceiveBufferSize = 16 * 1024 * 1024;
+                client.Client.SendBufferSize = 16 * 1024 * 1024;
+            }
+            catch { }
+            return client;
+        }
+
         // Normaliza endereco IPv4-mapped (::ffff:1.2.3.4) -> 1.2.3.4 puro.
         // Sem isso o Dictionary de Routes duplica entrada quando o cliente fala IPv4 num socket dual-stack.
         public static IPAddress NormalizeAddress(IPAddress addr)
