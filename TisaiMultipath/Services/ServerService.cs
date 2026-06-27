@@ -43,6 +43,9 @@ namespace TisaiMultipath.Services
 
         // Destino do forward (WG/next hop), parseado 1x — FwService envia inline pra cá.
         private static IPEndPoint? _destEndpoint;
+        // SocketAddress cacheado do DEST (v6-mapped p/ socket dual-stack) — usado no SendTo
+        // zero-alloc do forward (evita serializar o IPEndPoint a cada pacote).
+        private static SocketAddress? _destSockAddr;
 
         // -------- Seq dedup protocol (header de 6 bytes prepended pelos clientes) --------
         // Formato: [0xAA][seq3][seq2][seq1][seq0][0x55] + payload WG. Ver MULTIPATH-SEQ-DEDUP.md.
@@ -87,6 +90,11 @@ namespace TisaiMultipath.Services
             // EINVAL no LatencyThread em hosts com loopback dual-stack diferente, ex akm).
             // DEST parseado uma vez (forward inline, sem re-resolver por pacote).
             _destEndpoint = IPEndPoint.Parse(destination);
+            // v6-mapped pro SendTo zero-alloc no socket dual-stack (v4 puro daria EINVAL).
+            var destMapped = _destEndpoint.Address.AddressFamily == AddressFamily.InterNetwork
+                ? new IPEndPoint(_destEndpoint.Address.MapToIPv6(), _destEndpoint.Port)
+                : _destEndpoint;
+            _destSockAddr = destMapped.Serialize();
 
             // N threads de RECEIVE com SO_REUSEPORT (kernel balanceia por fluxo -> escala com
             // cores). Cada cliente (4-tupla fixa) cai sempre na MESMA thread -> estado por-cliente
@@ -151,31 +159,60 @@ namespace TisaiMultipath.Services
         {
             Console.WriteLine("[Server] FwService thread is running...");
 
-            //Initialize routes - Error check for null
             if (routes == null)
                 routes = new ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
 
+            // BATCH (recvmmsg): TISAI_BATCH=N (>1) pega N datagramas por syscall — corta a
+            // viagem user<->kernel que domina em pps alto. Mesma lógica por pacote (ProcessPacket).
+            int batch = 0;
+            int.TryParse(Environment.GetEnvironmentVariable("TISAI_BATCH"), out batch);
+            if (batch > 1)
+            {
+                Console.WriteLine($"[Server] FwService modo BATCH recvmmsg N={batch}");
+                var br = new BatchReceiver(recvSocket.Client, batch);
+                while (true)
+                {
+                    try { br.Receive((d, l, ip, port) => ProcessPacket(d, l, ip, port, recvSocket)); }
+                    catch (Exception ex) { Console.WriteLine(ex.ToString()); }
+                }
+            }
+
+            // Buffer + SocketAddress REUSADOS (zero-alloc no receive: sem new byte[] por pacote).
+            byte[] rxbuf = new byte[2048];
+            byte[] ipbuf = new byte[16];
+            var rxAddr = new SocketAddress(AddressFamily.InterNetworkV6);
             while (true)
             {
                 try
                 {
-                    // Socket dual-stack precisa IPv6Any aqui; IPv4 chega mapeado e e normalizado pra evitar duplicar Route.
-                    IPEndPoint _loopback = new IPEndPoint(IPAddress.IPv6Any, 0);
-                    byte[] data = recvSocket.Receive(ref _loopback);
-                    IPAddress clientAddr = Utils.NormalizeAddress(_loopback.Address);
+                    int len = recvSocket.Client.ReceiveFrom(rxbuf.AsSpan(), SocketFlags.None, rxAddr);
+                    // sockaddr_in6 no SocketAddress: porta BE @2, addr @8 (v6-mapped p/ v4).
+                    int port = (rxAddr[2] << 8) | rxAddr[3];
+                    for (int k = 0; k < 16; k++) ipbuf[k] = rxAddr[8 + k];
+                    ProcessPacket(rxbuf, len, new IPAddress(ipbuf), port, recvSocket);
+                }
+                catch (Exception ex) { Console.WriteLine(ex.ToString()); }
+            }
+        }
 
-                    //Any new packet received should be registered to be used a route to send packets back through
-                    // Lookup O(1) do Route canônico via índice (antes: FirstOrDefault = scan linear).
-                    Route _routeKey = new Route() { IPAddress = clientAddr, Port = _loopback.Port };
-                    if (!_routeIndex.TryGetValue(_routeKey, out Route? clientRoute) || clientRoute == null)
-                    {
-                        BlockingCollection<(byte[], UdpClient?)> _queue = new BlockingCollection<(byte[], UdpClient?)>();
-                        clientRoute = new Route(_queue, null, fwClient) { IPAddress = clientAddr, Port = _loopback.Port };
-                        routes.TryAdd(clientRoute, _queue);
-                        _routeIndex.TryAdd(clientRoute, clientRoute);
-                    }
-                    // Qualquer pacote recebido = rota viva (atualiza LastPing O(1), sem scan).
-                    clientRoute.LastPing = DateTime.UtcNow;
+        // Processa UM datagrama do cliente: registra rota, aprende índice WG, trata controle
+        // (3/2/1B), dedup seq, forwarda inline pro WG. Chamado pelo caminho single E pelo batch.
+        // rawSrcAddr = IP cru (v6-mapped p/ clientes v4); normaliza p/ a chave, usa cru no bounce.
+        private static void ProcessPacket(byte[] data, int len, IPAddress rawSrcAddr, int srcPort, UdpClient recvSocket)
+        {
+            // 'data' pode ser um buffer REUSADO maior que o pacote -> usar 'len', NÃO data.Length.
+            IPAddress clientAddr = Utils.NormalizeAddress(rawSrcAddr);
+
+            // Lookup O(1) do Route canônico via índice.
+            Route _routeKey = new Route() { IPAddress = clientAddr, Port = srcPort };
+            if (!_routeIndex.TryGetValue(_routeKey, out Route? clientRoute) || clientRoute == null)
+            {
+                BlockingCollection<(byte[], UdpClient?)> _queue = new BlockingCollection<(byte[], UdpClient?)>();
+                clientRoute = new Route(_queue, null, fwClient) { IPAddress = clientAddr, Port = srcPort };
+                routes!.TryAdd(clientRoute, _queue);
+                _routeIndex.TryAdd(clientRoute, clientRoute);
+            }
+            clientRoute.LastPing = DateTime.UtcNow;
 
                     // Aprende o índice WG do cliente no handshake INIT (type 1): o sender_index
                     // (offset 4 do pacote WG) é o mesmo que o WG carimba como receiver_index em
@@ -183,10 +220,10 @@ namespace TisaiMultipath.Services
                     // pras rotas DELE). wgOff pula o header seq se presente. Guard de tamanho
                     // garante que controle (3/2/1 byte) não entra aqui.
                     {
-                        bool isSeqPkt = _seqEnabled && data.Length >= SEQ_HEADER_SIZE
+                        bool isSeqPkt = _seqEnabled && len >= SEQ_HEADER_SIZE
                                         && data[0] == SEQ_MAGIC_HEAD && data[5] == SEQ_MAGIC_TAIL;
                         int wgOff0 = isSeqPkt ? SEQ_HEADER_SIZE : 0;
-                        if (data.Length >= wgOff0 + 8 && data[wgOff0] == 1)
+                        if (len >= wgOff0 + 8 && data[wgOff0] == 1)
                         {
                             uint cidx = (uint)data[wgOff0 + 4]
                                       | ((uint)data[wgOff0 + 5] << 8)
@@ -202,35 +239,35 @@ namespace TisaiMultipath.Services
                         }
                     }
 
-                    //Whenever clients enables/disables a route, a packet with 3 bytes is sent to this route letting the route know what state it should take
-                    if (data.Length == 3)
+                    // control de 3 bytes (enable/disable da rota)
+                    if (len == 3)
                     {
                         clientRoute.SetRouteActive(data[2]);
-                        continue;
+                        return;
                     }
 
-                    //Ping Packets will be bounced back - Wireguard Packets (and most regular packets) will always be larger than 2 byte
-                    if (data.Length == 2)
+                    // ping de 2 bytes volta (bounce) — envia pro IP cru (v6-mapped) no socket dual-stack
+                    if (len == 2)
                     {
-                        recvSocket.Send(data.Take(1).ToArray(), 1, _loopback);
-                        continue;
+                        recvSocket.Send(new byte[] { data[0] }, 1, new IPEndPoint(rawSrcAddr, srcPort));
+                        return;
                     }
 
-                    if(data.Length == 1)
+                    if(len == 1)
                     {
                         clientRoute.CalculateLatency(data[0]);
                     }
 
                     // -------- SEQ DEDUP (se ativado e header magic detectado) --------
-                    byte[] payload = data;
+                    int sendOff = 0; // strip do header seq vira só um offset (zero-alloc, sem new byte[])
                     if (_seqEnabled
-                        && data.Length >= SEQ_HEADER_SIZE
+                        && len >= SEQ_HEADER_SIZE
                         && data[0] == SEQ_MAGIC_HEAD
                         && data[5] == SEQ_MAGIC_TAIL)
                     {
                         // Tipo da msg WG vem logo APÓS o header seq de 6 bytes:
                         // 1=handshake init, 2=handshake response, 3=cookie reply, 4=transport data.
-                        byte wgType = data.Length > SEQ_HEADER_SIZE ? data[SEQ_HEADER_SIZE] : (byte)0;
+                        byte wgType = len > SEQ_HEADER_SIZE ? data[SEQ_HEADER_SIZE] : (byte)0;
                         bool isHandshake = wgType >= 1 && wgType <= 3;
 
                         // Marca este route como falando seq → respostas vão com header (O(1), já temos clientRoute)
@@ -249,7 +286,7 @@ namespace TisaiMultipath.Services
                             // por sessao evita colisao de seq entre clientes distintos.
                             uint session = 0;
                             int wgOff = SEQ_HEADER_SIZE;
-                            if (data.Length >= wgOff + 8)
+                            if (len >= wgOff + 8)
                                 session = (uint)data[wgOff + 4]
                                         | ((uint)data[wgOff + 5] << 8)
                                         | ((uint)data[wgOff + 6] << 16)
@@ -288,31 +325,23 @@ namespace TisaiMultipath.Services
                             if (isDup)
                             {
                                 Interlocked.Increment(ref _totalSeqDeduped);
-                                continue; // descarta duplicata, não forwarda
+                                return; // descarta duplicata, não forwarda
                             }
                             Interlocked.Increment(ref _totalSeqPassed);
                         }
 
-                        // Strip 6-byte header antes de entregar ao WG kernel (handshake e dado)
-                        payload = new byte[data.Length - SEQ_HEADER_SIZE];
-                        Buffer.BlockCopy(data, SEQ_HEADER_SIZE, payload, 0, payload.Length);
+                        // Strip do header de 6 bytes vira só um offset — o SendTo manda data[6..].
+                        sendOff = SEQ_HEADER_SIZE;
                     }
                     else if (_seqEnabled)
                     {
                         Interlocked.Increment(ref _totalLegacy);
                     }
 
-                    // FORWARD INLINE pro DEST via bckClient (era queue.Add -> 1 WorkerThread
-                    // único drenando = gargalo de envio single-thread; agora cada thread
-                    // FwService envia direto, em paralelo. sendto concorrente no mesmo socket
-                    // é thread-safe). bckClient recebe o downstream do WG -> BckService.
-                    bckClient.Send(payload, payload.Length, _destEndpoint!);
-                }
-                catch(Exception ex)
-                {
-                    Console.WriteLine(ex.ToString());
-                }
-            }
+            // FORWARD INLINE pro DEST via SendTo zero-alloc (Span + SocketAddress cacheado):
+            // sem new byte[] do strip, sem serializar o IPEndPoint a cada pacote. sendOff
+            // pula o header seq (6) quando presente, senão 0.
+            bckClient.Client.SendTo(data.AsSpan(sendOff, len - sendOff), SocketFlags.None, _destSockAddr!);
         }
 
         //Received from Server sent back to MP Client
