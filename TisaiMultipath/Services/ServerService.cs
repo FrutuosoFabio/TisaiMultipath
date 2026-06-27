@@ -20,6 +20,14 @@ namespace TisaiMultipath.Services
         // ou corrompia o dict → retorno travava PERMANENTE até restart. ConcurrentDictionary
         // tem iteração snapshot (não lança) e Add/Remove atômicos.
         private static ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>? routes = new ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
+
+        // Índice O(1) (IP,Port)->Route canônico. ConcurrentDictionary.ContainsKey é O(1)
+        // mas NÃO retorna o objeto-chave armazenado; sem isso o FwService fazia
+        // routes.Keys.FirstOrDefault(r => r.Equals(...)) = SCAN LINEAR O(N) por pacote,
+        // VÁRIAS vezes (registro + 3B + 1B + seq). Com muitas rotas a thread única do
+        // FwService afogava no scan e o buffer UDP estourava (drop ~58% em 100 rotas a
+        // 6400pps, com CPU em só 23%). Com o índice: 1 lookup O(1) por pacote.
+        private static ConcurrentDictionary<Route, Route> _routeIndex = new ConcurrentDictionary<Route, Route>();
         private static UdpClient fwClient = Utils.CreateDualStackUdpClient(0);
         private static UdpClient bckClient = Utils.CreateDualStackUdpClient(0);
 
@@ -84,6 +92,7 @@ namespace TisaiMultipath.Services
                     if((DateTime.UtcNow - r.LastPing).TotalSeconds > 15)
                     {
                         routes.TryRemove(r, out _);
+                        _routeIndex.TryRemove(r, out _);  // mantém o índice O(1) em sync com routes
                     }
                 }
 
@@ -132,29 +141,22 @@ namespace TisaiMultipath.Services
                     IPAddress clientAddr = Utils.NormalizeAddress(_loopback.Address);
 
                     //Any new packet received should be registered to be used a route to send packets back through
-                    Route _route = new Route() { IPAddress = clientAddr, Port = _loopback.Port };
-                    if (!routes.ContainsKey(_route))
+                    // Lookup O(1) do Route canônico via índice (antes: FirstOrDefault = scan linear).
+                    Route _routeKey = new Route() { IPAddress = clientAddr, Port = _loopback.Port };
+                    if (!_routeIndex.TryGetValue(_routeKey, out Route? clientRoute) || clientRoute == null)
                     {
-                        BlockingCollection<(byte[], UdpClient?)>? _queue = new BlockingCollection<(byte[], UdpClient?)>();
-                        routes.TryAdd(new Route(_queue, null, fwClient) { IPAddress = clientAddr, Port = _loopback.Port }, _queue);
+                        BlockingCollection<(byte[], UdpClient?)> _queue = new BlockingCollection<(byte[], UdpClient?)>();
+                        clientRoute = new Route(_queue, null, fwClient) { IPAddress = clientAddr, Port = _loopback.Port };
+                        routes.TryAdd(clientRoute, _queue);
+                        _routeIndex.TryAdd(clientRoute, clientRoute);
                     }
-                    else
-                    {
-                        // Qualquer pacote recebido = rota viva. Atualiza LastPing do registro existente
-                        // pra nao expirar sob trafego alto enquanto o ping reply (1B) ta na fila.
-                        var existing = routes.Keys.FirstOrDefault(r => r.Equals(_route));
-                        if (existing != null) existing.LastPing = DateTime.UtcNow;
-                    }
+                    // Qualquer pacote recebido = rota viva (atualiza LastPing O(1), sem scan).
+                    clientRoute.LastPing = DateTime.UtcNow;
 
                     //Whenever clients enables/disables a route, a packet with 3 bytes is sent to this route letting the route know what state it should take
                     if (data.Length == 3)
                     {
-                        Route? r = routes.Keys.FirstOrDefault(r => r.Equals(_route));
-                        if (r == null)
-                            continue;
-
-                        r.SetRouteActive(data[2]);
-
+                        clientRoute.SetRouteActive(data[2]);
                         continue;
                     }
 
@@ -167,11 +169,7 @@ namespace TisaiMultipath.Services
 
                     if(data.Length == 1)
                     {
-                        Route? r = routes.Keys.FirstOrDefault(r => r.Equals(_route));
-                        if (r == null)
-                            continue;
-
-                        r.CalculateLatency(data[0]);
+                        clientRoute.CalculateLatency(data[0]);
                     }
 
                     // -------- SEQ DEDUP (se ativado e header magic detectado) --------
@@ -186,9 +184,8 @@ namespace TisaiMultipath.Services
                         byte wgType = data.Length > SEQ_HEADER_SIZE ? data[SEQ_HEADER_SIZE] : (byte)0;
                         bool isHandshake = wgType >= 1 && wgType <= 3;
 
-                        // Marca este route como falando seq → respostas vão com header
-                        Route? rt = routes.Keys.FirstOrDefault(r => r.Equals(_route));
-                        if (rt != null) rt.UsesSeq = true;
+                        // Marca este route como falando seq → respostas vão com header (O(1), já temos clientRoute)
+                        clientRoute.UsesSeq = true;
 
                         // HANDSHAKE NUNCA é deduplicado: forwarda TODA cópia pro WG. Handshake é
                         // raro (rekey ~120s) e perder 1 = stall fixo de 5s no WG (pior em link
