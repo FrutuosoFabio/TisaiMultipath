@@ -26,8 +26,14 @@ namespace TisaiMultipath.Models
 
         public Route(BlockingCollection<(byte[], UdpClient?)>? queue, BlockingCollection<byte[]>? bckQueue = null, UdpClient? udpClient = null)
         {
+            // LongRunning = thread DEDICADA por rota fora do ThreadPool (não Task.Run).
+            // WorkerThread bloqueia em queue.Take() pra sempre. Em ThreadPool, N rotas =
+            // N workers presos -> o pool injeta mais (throttle ~1/seg) -> starvation:
+            // rajada de rotas novas (CS2 conectando + churn) engasga TODAS as rotas do
+            // processo juntas. LongRunning tira do pool (sem starvation) e mantém semântica
+            // de Task (exceção não derruba o processo, diferente de new Thread).
             if (queue != null)
-                Task.Run(() => WorkerThread(queue));
+                Task.Factory.StartNew(() => WorkerThread(queue), TaskCreationOptions.LongRunning);
 
             if (bckQueue != null)
             {
@@ -45,9 +51,9 @@ namespace TisaiMultipath.Models
             if (bckQueue != null || queue != null)
             {
                 if (udpClient != null)
-                    Task.Run(() => LatencyThread(ref udpClient));
+                    Task.Factory.StartNew(() => LatencyThread(ref udpClient), TaskCreationOptions.LongRunning);
                 else
-                    Task.Run(() => LatencyThread(ref _routeUdp));
+                    Task.Factory.StartNew(() => LatencyThread(ref _routeUdp), TaskCreationOptions.LongRunning);
             }
 
         }

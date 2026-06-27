@@ -59,14 +59,14 @@ namespace TisaiMultipath.Services
             _seqEnabled = seqEnabled;
             Console.WriteLine($"Starting server on port {port}... seqDedup={(seqEnabled ? "ON" : "OFF")}");
 
-            _ = Task.Run(() =>
-                    FwService(int.Parse(port), destination)
-                );
+            // LongRunning (NÃO Task.Run nem new Thread): FwService/BckService bloqueiam
+            // pra sempre em Receive(). LongRunning dá thread DEDICADA fora do ThreadPool
+            // (sem prender workers -> sem starvation). Continua Task -> exceção não-tratada
+            // falha a task silenciosa, NÃO derruba o processo (new Thread crashava via
+            // EINVAL no LatencyThread em hosts com loopback dual-stack diferente, ex akm).
+            Task.Factory.StartNew(() => FwService(int.Parse(port), destination), TaskCreationOptions.LongRunning);
 
-
-            _ = Task.Run(() =>
-                    BckService()
-                );
+            Task.Factory.StartNew(() => BckService(), TaskCreationOptions.LongRunning);
 
             if (routes == null)
                 routes = new ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>();
