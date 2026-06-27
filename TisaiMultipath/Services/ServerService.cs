@@ -28,6 +28,16 @@ namespace TisaiMultipath.Services
         // FwService afogava no scan e o buffer UDP estourava (drop ~58% em 100 rotas a
         // 6400pps, com CPU em só 23%). Com o índice: 1 lookup O(1) por pacote.
         private static ConcurrentDictionary<Route, Route> _routeIndex = new ConcurrentDictionary<Route, Route>();
+
+        // Demux do DOWNSTREAM por cliente: índice WG do cliente -> as rotas (paths) DELE.
+        // Sem isso, o BckService faz broadcast de CADA resposta do WG pra TODAS as rotas
+        // (O(N) waste: com M players x 2 paths = 2M envios por pacote, sendo 2 úteis). Aqui:
+        // aprende o índice no handshake INIT (sender_index do cliente) e no downstream casa
+        // pelo receiver_index -> manda só pras 2 rotas do dono. Índice desconhecido (proxy
+        // subiu no meio da sessão) -> fallback broadcast (seguro, não quebra nada).
+        private static readonly ConcurrentDictionary<uint, ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>> _clientIndexRoutes
+            = new ConcurrentDictionary<uint, ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>>();
+
         private static UdpClient fwClient = Utils.CreateDualStackUdpClient(0);
         private static UdpClient bckClient = Utils.CreateDualStackUdpClient(0);
 
@@ -113,6 +123,12 @@ namespace TisaiMultipath.Services
                     {
                         routes.TryRemove(r, out _);
                         _routeIndex.TryRemove(r, out _);  // mantém o índice O(1) em sync com routes
+                        // Tira a rota do demux de downstream também (senão vira rota fantasma).
+                        if (r.WgClientIndex != 0 && _clientIndexRoutes.TryGetValue(r.WgClientIndex, out var crs))
+                        {
+                            crs.TryRemove(r, out _);
+                            if (crs.IsEmpty) _clientIndexRoutes.TryRemove(r.WgClientIndex, out _);
+                        }
                     }
                 }
 
@@ -160,6 +176,31 @@ namespace TisaiMultipath.Services
                     }
                     // Qualquer pacote recebido = rota viva (atualiza LastPing O(1), sem scan).
                     clientRoute.LastPing = DateTime.UtcNow;
+
+                    // Aprende o índice WG do cliente no handshake INIT (type 1): o sender_index
+                    // (offset 4 do pacote WG) é o mesmo que o WG carimba como receiver_index em
+                    // todo downstream desse cliente -> permite o demux no BckService (manda só
+                    // pras rotas DELE). wgOff pula o header seq se presente. Guard de tamanho
+                    // garante que controle (3/2/1 byte) não entra aqui.
+                    {
+                        bool isSeqPkt = _seqEnabled && data.Length >= SEQ_HEADER_SIZE
+                                        && data[0] == SEQ_MAGIC_HEAD && data[5] == SEQ_MAGIC_TAIL;
+                        int wgOff0 = isSeqPkt ? SEQ_HEADER_SIZE : 0;
+                        if (data.Length >= wgOff0 + 8 && data[wgOff0] == 1)
+                        {
+                            uint cidx = (uint)data[wgOff0 + 4]
+                                      | ((uint)data[wgOff0 + 5] << 8)
+                                      | ((uint)data[wgOff0 + 6] << 16)
+                                      | ((uint)data[wgOff0 + 7] << 24);
+                            if (cidx != 0 && routes != null && routes.TryGetValue(clientRoute, out var cq))
+                            {
+                                clientRoute.WgClientIndex = cidx;
+                                var set = _clientIndexRoutes.GetOrAdd(cidx,
+                                    _ => new ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>());
+                                set.TryAdd(clientRoute, cq);
+                            }
+                        }
+                    }
 
                     //Whenever clients enables/disables a route, a packet with 3 bytes is sent to this route letting the route know what state it should take
                     if (data.Length == 3)
@@ -312,13 +353,27 @@ namespace TisaiMultipath.Services
                         Buffer.BlockCopy(data, 0, seqData, SEQ_HEADER_SIZE, data.Length);
                     }
 
-                    //Send packet back through all routes that have connected to server.
+                    // DEMUX por-cliente: o receiver_index do pacote downstream identifica o player.
+                    // type 2 (handshake response) tem o receiver_index no offset 8; type 3/4 no
+                    // offset 4. Casa com o WgClientIndex aprendido no INIT -> manda SÓ pras rotas
+                    // (paths) DESSE player, em vez de broadcast pra TODAS (O(N) waste). Índice
+                    // desconhecido (sessão sem INIT visto) -> fallback broadcast (seguro).
+                    int idxOff = (wgType == 2) ? 8 : 4;
+                    uint clientIdx = (data.Length >= idxOff + 4)
+                        ? ((uint)data[idxOff] | ((uint)data[idxOff + 1] << 8) | ((uint)data[idxOff + 2] << 16) | ((uint)data[idxOff + 3] << 24))
+                        : 0;
+
+                    ConcurrentDictionary<Route, BlockingCollection<(byte[], UdpClient?)>>? targets = null;
+                    if (clientIdx != 0) _clientIndexRoutes.TryGetValue(clientIdx, out targets);
+                    var dest = (targets != null && !targets.IsEmpty) ? targets : routes;
+
                     //Per-route: routes que falaram seq recebem versão seq-encoded; handshake e legacy recebem raw.
-                    foreach (var route in routes)
-                    {
-                        byte[] toSend = (_seqEnabled && !isHandshake && route.Key.UsesSeq && seqData != null) ? seqData : data;
-                        route.Value.Add((toSend, fwClient));
-                    }
+                    if (dest != null)
+                        foreach (var route in dest)
+                        {
+                            byte[] toSend = (_seqEnabled && !isHandshake && route.Key.UsesSeq && seqData != null) ? seqData : data;
+                            route.Value.Add((toSend, fwClient));
+                        }
                 }
                 catch(Exception ex)
                 {

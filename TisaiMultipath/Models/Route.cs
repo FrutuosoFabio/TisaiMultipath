@@ -81,6 +81,14 @@ namespace TisaiMultipath.Models
         /// </summary>
         public bool UsesSeq { get; set; } = false;
 
+        /// <summary>
+        /// Índice WG do CLIENTE desta sessão (sender_index do handshake INIT). Usado pelo
+        /// demux do downstream: o BckService manda a resposta só pras rotas com esse índice
+        /// (o WG carimba ele como receiver_index no downstream), em vez de broadcast pra
+        /// TODAS as rotas. 0 = ainda não aprendido (INIT não visto) -> fallback broadcast.
+        /// </summary>
+        public uint WgClientIndex { get; set; } = 0;
+
         private readonly object _udpLock = new object();
 
         private void WorkerThread(BlockingCollection<(byte[], UdpClient?)> queue)
